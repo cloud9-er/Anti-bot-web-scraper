@@ -24,26 +24,59 @@ class HTTPConnectionManager():
     def __init__(self, maximum = 2, timeout = 5.0):
         self.maximum = maximum
         self.timeout = timeout
+        self._connections = {}
+        self._in_use = set()
 
         self._ssl_context = ssl.create_default_context()
 
     def create(self, key):
-        return http.client.HTTPSConnection(host = key.host, key = key.port, timeout = self.timeout, context = self._ssl_context)
+        return http.client.HTTPSConnection(host = key.host, port = key.port, timeout = self.timeout, context = self._ssl_context)
 
     def acquire(self, host, port = 443):
-        pass
+        key = (host, port)
+        connections = self._connections.get(key, [])
+
+        for conn in connections:
+            if conn not in self._in_use:
+                self._in_use.add(conn)
+                return conn
+
+        total_connections = sum(
+            len(group) for group in self._connections.values()
+    )
+
+        if total_connections >= self.maximum:
+            raise RuntimeError("Maximum connection limit reached")
+
+        connection_key = ConnectionKey(host, port)
+        conn = self.create(connection_key)
+
+        self._connections.setdefault(key, []).append(conn)
+        self._in_use.add(conn)
+        return conn
     def release(self, conn):
-        pass
+        if conn not in self._in_use:
+            raise ValueError("Connection is not currently in use")
+        self._in_use.remove(conn)
 
     def shutdown(self, conn):
-        pass
+        for key, connections in list(self._connections.items()):
+            if conn in connections:
+                connections.remove(conn)
+                if not connections:
+                    del self._connections[key]
+                self._in_use.discard(conn)
+                conn.close()
+                return
+        raise ValueError("Connection is not managed by this manager")
 
 def decompose(url):
     decomposed = urlsplit(url)
     decomposed_dict = {
         "scheme" : decomposed.scheme,
-        "host" : decomposed.netloc,
-        "path" : decomposed.path,
+        "host" : decomposed.hostname,
+        "port": decomposed.port,
+        "path" : decomposed.path or '/',
         "query" : decomposed.query,
         "fragment" : decomposed.fragment
     }
@@ -52,21 +85,51 @@ def decompose(url):
 def connect(host, port = 443):
     return http.client.HTTPSConnection(host, port)
 
-def get_response(url):
+def get_response(url, manager):
+    parts = decompose(url)
+
+    if parts["scheme"] != "https":
+        raise ValueError("Only HTTPS URLs are supported")
+
+    host = parts["host"]
+    port = parts["port"] or 443
+    path = parts["path"]
+
+    if parts["query"]:
+        path += "?" + parts["query"]
+
+    conn = manager.acquire(host, port)
+
     try:
-        with urllib.request.urlopen(url) as response:
-            headers = response.getheaders()
-            content = response.read().decode("utf-8")
+        conn.request("GET", path)
+        response = conn.getresponse()
 
-    except urllib.error.HTTPError as e:
-        print(e.status)
+        headers = response.getheaders()
+        body = response.read().decode("utf-8", errors="replace")
 
+        result = {
+            "status": response.status,
+            "reason": response.reason,
+            "headers": headers,
+            "body": body,
+        }
+    except Exception:
+        manager.shutdown(conn)
+        raise
+    else:
+        manager.release(conn)
+        return result
+
+
+
+if __name__ == "__main__":
+    manager = HTTPConnectionManager()
+    try:
+        response = get_response(url, manager)
+        print("Status:", response["status"])
+        print("Reason:", response["reason"])
+        print("Body preview:", response["body"][:300])
     finally:
-        #location for ConnectionManager
-        conn.close()
-        return content
-
-decomposed = decompose(url)
-conn = connect(decomposed["host"])
-response = get_response(url)
-
+        for connections in list(manager._connections.values()):
+            for conn in list(connections):
+                manager.shutdown(conn)
